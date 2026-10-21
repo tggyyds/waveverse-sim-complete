@@ -9,3 +9,6 @@ build/
 dist/
 renders/
 results/
+
+# articulated micro-Doppler test outputs
+tests/articulated/_out/

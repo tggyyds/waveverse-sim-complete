@@ -9,6 +9,11 @@ phase coherence** and generates FMCW radar signals from indoor scenes and moving
 human meshes using GPU ray tracing, CUDA signal synthesis, and grouped human
 scattering.
 
+> **This repository extends the official [WaveVerse-Sim](https://github.com/penn-waves-lab/WaveVerse-Sim) release (commit `771df9a`)
+> with articulated, per-vertex micro-Doppler** (`TemporalBurst.signals_articulated`). Everything else (spatial / temporal
+> workflows, static scattering, materials, radar model) is the unchanged upstream code; see
+> [Articulated micro-Doppler](#-articulated-micro-doppler) below.
+
 
 ## 🛠️ Installation
 
@@ -73,6 +78,56 @@ python examples/plot_doppler.py results/temporal --full-range
 ```
 
 The full-range figure is saved to `results/temporal/doppler_full_range.png`.
+
+## 🚀 Articulated micro-Doppler
+
+The official temporal example moves the whole human mesh rigidly. `TemporalBurst.signals_articulated` adds
+**per-vertex (articulated) motion inside a chirp burst**: every human scattering path follows the mesh vertex it was
+traced from, so limbs that move differently produce their own Doppler components (micro-Doppler). One reference ray
+trace per burst is reused for all chirps, exactly as the rigid `signals()` does.
+
+```python
+burst = TemporalBurst(scene, traced, spec, tx, rx, look, "temporal_human",
+                      groups=groups, group_displacement=[0, 0, 0])      # grouped burst (as in the temporal example)
+signal = burst.signals_articulated(
+    vertex_displacements=displacements,   # (chirps, burst.n_vertices, 3) world-frame offsets of every mesh vertex
+    unknown_interactions="barycentric",   # paths on the human without a vertex identity move with their triangle
+)                                         # -> (chirps, RX*TX, ADC), same convention as signals()
+print(burst.articulation_audit())         # counts / power of known-vertex, static and barycentric interactions
+```
+
+Displacements are relative to `burst.reference_vertices`. The path set, visibility, last-interaction normals and
+prefix Fresnel terms stay frozen for the burst, as in `signals()`; use one burst per radar frame for longer motion.
+`unknown_interactions` can also be `"exclude"` (drop such paths) or `None` (raise if they exist).
+
+**Example** (bundled laundry room and person; the right forearm swings about the elbow during a 32-chirp burst):
+
+```bash
+python examples/articulated_temporal_example.py
+```
+
+**Validation** (identity, signal-level and end-to-end checks; a few minutes on one GPU):
+
+```bash
+bash tests/articulated/run_all.sh
+```
+
+| Check | Criterion |
+| --- | --- |
+| Every expanded child keeps its source vertex id; official ownership; TX visibility (independent ray test); batching invariance | exact |
+| Zero displacement = `signals(zeros)` | rel. L2 ≤ 1e-6 (measured 0) |
+| Same displacement for every vertex = rigid `signals()` | per-path outputs bitwise, FMCW rel. L2 ≤ 1e-5 (measured 0) |
+| One moving part vs independent NumPy path length / phase / Doppler | ≤ 5 µm, ≤ 1°, ≤ 0.05 bins |
+| Two parts at different velocities + a static part | ≤ 5 µm, ≤ 1°, ≤ 0.1 bins; static part at 0 bins |
+
+The rigid API is unchanged: on the same scene, `signals()` of this repository and of the official release agree to the
+official code's own run-to-run variation (≤ 2e-7 relative, identical path counts). On some GPU / driver combinations
+depth-3 tracing needs `drjit.set_flag(drjit.JitFlag.VCallRecord, False)` before Sionna is imported; the example and
+the tests set it.
+
+**Scope.** The extension validates the chain from mesh motion to radar Doppler (vertex identity, path-length and phase
+evolution, mixer, FFT, sign, scaling). It is not a calibration against measured human radar data, and the sparse human
+scattering of the default ray budget can miss small, fast body parts.
 
 ## 🙏 Acknowledgements
 

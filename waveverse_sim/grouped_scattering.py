@@ -6,6 +6,7 @@ force equal received power after changing geometry or coherent interference.
 """
 
 import pickle
+import time
 
 import numpy as np
 import tensorflow as tf
@@ -175,8 +176,20 @@ def _blocked(solver, start, end):
     ) | (distance < 1e-7)
 
 
+INTERACTION_KNOWN_VERTEX = 0
+INTERACTION_STATIC = 1
+INTERACTION_UNKNOWN_MOVING = 2
+INTERACTION_NONE = 3
+
+
 def grouped_path_batches(
-    scene, traced, moving_object, groups, displacement, batch_candidates=100000
+    scene,
+    traced,
+    moving_object,
+    groups,
+    displacement,
+    batch_candidates=100000,
+    return_interactions=False,
 ):
     """Yield regenerated scattered paths, tmp data, field weights and audits.
 
@@ -184,6 +197,12 @@ def grouped_path_batches(
     Whole parent families stay in a batch so occlusion normalization is exact.
     Reflection prefixes are retained; only the first human hit is expanded,
     as specified in the paper. No global sensor-to-all-vertices connection.
+
+    return_interactions=True (articulated extension) additionally yields, per
+    output path and interaction, the source vertex id of every expanded
+    first hit (official vertex order), a static sentinel (len(vertices)) and an
+    explicit "unknown moving" kind for human hits that are not expanded
+    vertices. Paths, weights and audits are unchanged.
     """
     solver = scene._solver_paths
     original, tmp = traced[2], traced[6]
@@ -242,6 +261,19 @@ def grouped_path_batches(
         parents = np.repeat(np.arange(last - first), lengths[first:last])
         expanded = np.repeat(local_groups >= 0, lengths[first:last])
         changed = np.flatnonzero(expanded)
+        if return_interactions:
+            id_start = time.perf_counter()
+            # Source vertex id of each expanded depth-0 child, built with the same
+            # per-parent segments as expand_hit_mesh_index (offsets of lengths).
+            local_offsets = np.r_[0, np.cumsum(lengths[first:last])]
+            vertex0 = np.full(len(parents), len(vertices), np.int32)
+            for position in np.flatnonzero(local_groups >= 0):
+                vi = groups.groups[local_groups[position]]
+                a, b = local_offsets[position], local_offsets[position + 1]
+                vertex0[a:b] = vi
+                if not np.array_equal(xyz[0, 0, a:b], vertices[vi]):
+                    raise AssertionError("Expanded child/vertex-id alignment broken")
+            id_seconds = time.perf_counter() - id_start
         tx_blocked = next_blocked = 0
         if len(changed):
             # Recheck visibility for the changed TX->vertex and vertex->next-bounce segments.
@@ -292,5 +324,45 @@ def grouped_path_batches(
                 int(((depth == d) & expanded[child]).sum()) for d in range(len(idx))
             ],
         )
-        yield paths, data, weights, audit
+        if not return_interactions:
+            yield paths, data, weights, audit
+        else:
+            id_start = time.perf_counter()
+            interactions = _path_interactions(
+                idx, xyz, child, depth, expanded, vertex0,
+                primitive_to_face, len(vertices),
+            )
+            interactions["seconds"] = id_seconds + time.perf_counter() - id_start
+            yield paths, data, weights, audit, interactions
         first = last
+
+
+def _path_interactions(idx, xyz, child, depth, expanded, vertex0, prim_to_face, n_vertices):
+    """Per output path and interaction: kind, vertex id (sentinel n_vertices), human face, point.
+
+    Output path j is expanded candidate child[j] truncated after interaction depth[j]
+    (Sionna _scat_prefixes_2_paths order, depth-major). Interaction 0 of an expanded
+    child is its source vertex; any other human hit is a sampled surface point of the
+    parent ray (kind unknown moving) and is never mapped to a vertex here.
+    """
+    D, P = idx.shape[0], len(child)
+    k = np.arange(D)[:, None]
+    prim = idx[:, 0, child]
+    if np.any((prim < 0) & (k <= depth[None])):
+        raise AssertionError("Missing primitive inside a retained path prefix")
+    face = np.where(k <= depth[None], prim_to_face[np.where(prim < 0, -1, prim)], -1)
+    kind = np.full((D, P), INTERACTION_STATIC, np.int8)
+    kind[face >= 0] = INTERACTION_UNKNOWN_MOVING
+    vertex = np.full((D, P), n_vertices, np.int32)
+    known = expanded[child]
+    kind[0, known] = INTERACTION_KNOWN_VERTEX
+    vertex[0, known] = vertex0[child[known]]
+    kind[k > depth[None]] = INTERACTION_NONE
+    face[kind == INTERACTION_NONE] = -1
+    return dict(
+        kind=kind,
+        vertex=vertex,
+        face=face.astype(np.int32),
+        points=xyz[:, 0, child].astype(np.float32),
+        depth=depth.astype(np.int32),
+    )
